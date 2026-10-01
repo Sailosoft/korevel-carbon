@@ -1,0 +1,371 @@
+meta:
+  plan: carbon-portal-models-and-data
+  module: carbon-portal
+  created: "2026-10-01"
+  status: implemented
+  constraints_source: AGENTS.md (offline-first Dexie, MUI components, modular layout, src/app routing only)
+
+goal: >-
+  Define the best domain models, Dexie tables, seed data, and derived view
+  models for the Carbon Portal mock app so every screen can be built against
+  realistic, auditable carbon-accounting data with no backend.
+
+principles:
+  - Mock only: Dexie is a browser mock database; single schema version, no migrations.
+  - GHG Protocol shape: activity -> emission factor -> emission record, scoped 1/2/3.
+  - Derived data (KPIs, trends, progress) is computed by services, never stored twice.
+  - Emission records are recalculated from activity + factor, never hand-edited.
+  - All screens read through liveQuery so the UI stays reactive while offline.
+  - Dates are ISO strings (YYYY-MM for periods, YYYY-MM-DD for events) for easy indexing.
+
+stack:
+  database: dexie ^4
+  reactive_reads: dexie-react-hooks (useLiveQuery)
+  tables: "@mui/x-data-grid"
+  ui_state: zustand (filters, selected period, active tab)
+  future_api: "@tanstack/react-query reserved for a real API later; unused in the mock"
+  validation: zod optional, only if shared validation grows; not required for v1
+
+file_structure: |
+  src/app/modules/carbon-portal/            # routing only (Next.js pages/layouts)
+  src/modules/carbon-portal/
+    docs/carbon-portal.plan.yaml            # this plan
+    db/
+      database.ts                           # class CarbonPortalDB extends Dexie
+      schema.ts                             # version(1).stores({...}) table names + indexes
+      types.ts                              # row types (Facility, Activity, ...)
+      seed.ts                               # seedIfEmpty() deterministic mock data
+      indexes.ts                            # exported STORE constants (typo safety)
+    services/
+      calculateEmissions.ts                 # activity x factor -> emission record
+      aggregates.ts                         # KPIs, scope breakdown, monthly trend
+      reporting.ts                          # report snapshot generation
+    hooks/
+      useCarbonData.ts                      # thin useLiveQuery wrappers per screen
+    store/
+      portalStore.ts                        # zustand: filters, period, navigation state
+    components/
+      CarbonPortalHome.tsx                  # existing, becomes overview/dashboard
+      ...                                   # one file per screen section (split when long)
+    index.ts                                # barrel
+
+models:
+  - table: facilities
+    purpose: Sites/business units that own emissions (scope 1 and 2).
+    primaryKey: id
+    indexes: [code, country, isActive]
+    fields:
+      - { name: id, type: string, note: uuid }
+      - { name: code, type: string, unique: true, example: FAC-NL-01 }
+      - { name: name, type: string }
+      - { name: city, type: string }
+      - { name: country, type: string, iso2: true }
+      - { name: sector, type: string, example: "Manufacturing" }
+      - { name: floorAreaM2, type: number, nullable: true, note: intensity denominator }
+      - { name: headcount, type: number, nullable: true }
+      - { name: isActive, type: boolean }
+      - { name: openedAt, type: string, format: date }
+
+  - table: emissionFactors
+    purpose: Reusable factor library (DEFRA/EPA/IPCC/IEA style) for activity -> CO2e.
+    primaryKey: id
+    indexes: [scope, category, source, "[scope+category]"]
+    fields:
+      - { name: id, type: string }
+      - { name: key, type: string, unique: true, example: "diesel-combustion-stationary" }
+      - { name: scope, type: number, enum: [1, 2, 3] }
+      - { name: category, type: string, note: "GHG Protocol category, e.g. fuel-combustion, purchased-electricity, business-travel, purchased-goods" }
+      - { name: activity, type: string, example: "Diesel (stationary)" }
+      - { name: unit, type: string, example: "litre" }
+      - { name: co2ePerUnit, type: number, note: "kg CO2e per unit" }
+      - { name: gwpSet, type: string, enum: [AR4, AR5, AR6] }
+      - { name: source, type: string, enum: [DEFRA, EPA, IPCC, IEA, EXIOBASE] }
+      - { name: vintageYear, type: number }
+      - { name: region, type: string, nullable: true, note: "null = global" }
+
+  - table: activities
+    purpose: Raw activity data (the input truth) grouped by facility and month.
+    primaryKey: id
+    indexes: [facilityId, date, scope, sourceType, "[facilityId+date]", category]
+    fields:
+      - { name: id, type: string }
+      - { name: facilityId, type: string, ref: facilities.id }
+      - { name: date, type: string, format: month, example: "2026-08" }
+      - { name: scope, type: number, enum: [1, 2, 3] }
+      - { name: category, type: string, note: "must match an emissionFactors category" }
+      - { name: sourceType, type: string, enum: [natural_gas, diesel, gasoline, electricity_grid, purchased_heat, company_vehicles, domestic_flights, international_flights, rail, waste, water, purchased_goods, capital_goods, upstream_transport, commuting, waste_treatment] }
+      - { name: quantity, type: number }
+      - { name: unit, type: string, note: "must match factor unit" }
+      - { name: supplierId, type: string, nullable: true, ref: suppliers.id, note: "scope 3 only" }
+      - { name: factorId, type: string, ref: emissionFactors.id }
+      - { name: dataQuality, type: string, enum: [primary, secondary, spend_based] }
+      - { name: notes, type: string, nullable: true }
+      - { name: createdAt, type: string, format: datetime }
+      - { name: updatedAt, type: string, format: datetime }
+
+  - table: emissions
+    purpose: Calculated CO2e per activity (derived but cached for fast tables/charts).
+    primaryKey: id
+    indexes: [activityId, scope, date, "[scope+date]", facilityId]
+    upsert_rule: Recomputed whenever its activity or factor changes (delete + reinsert by activityId).
+    fields:
+      - { name: id, type: string }
+      - { name: activityId, type: string, unique: true, ref: activities.id }
+      - { name: facilityId, type: string, ref: facilities.id, denormalized_for_filtering: true }
+      - { name: date, type: string, format: month, denormalized_for_filtering: true }
+      - { name: scope, type: number, enum: [1, 2, 3] }
+      - { name: co2eKg, type: number }
+      - { name: co2eTonnes, type: number, note: "co2eKg / 1000, rounded to 3dp" }
+      - { name: method, type: string, enum: [factor_based, spend_based] }
+      - { name: calculatedAt, type: string, format: datetime }
+
+  - table: suppliers
+    purpose: Value-chain partners for scope 3 categories 1 and 4.
+    primaryKey: id
+    indexes: [category, country, rating]
+    fields:
+      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: category, type: string, example: "Raw materials" }
+      - { name: country, type: string, iso2: true }
+      - { name: annualSpend, type: number, note: "in reporting currency" }
+      - { name: dataQuality, type: string, enum: [primary, secondary, spend_based] }
+      - { name: rating, type: number, enum: [1, 2, 3, 4, 5], note: "engagement rating" }
+      - { name: isActive, type: boolean }
+
+  - table: targets
+    purpose: Decarbonization targets (SBTi-style) with baseline and target year.
+    primaryKey: id
+    indexes: [status, scope]
+    fields:
+      - { name: id, type: string }
+      - { name: name, type: string, example: "Reduce scope 1+2 42% by 2030" }
+      - { name: scope, type: string, enum: ["1", "2", "3", "1+2", "1+2+3"] }
+      - { name: baseYear, type: number }
+      - { name: baselineTonnes, type: number }
+      - { name: targetYear, type: number }
+      - { name: targetTonnes, type: number }
+      - { name: status, type: string, enum: [draft, committed, achieved, at_risk] }
+      - { name: owner, type: string }
+
+  - table: projects
+    purpose: Reduction initiatives that deliver against targets.
+    primaryKey: id
+    indexes: [status, facilityId, targetId]
+    fields:
+      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: targetId, type: string, nullable: true, ref: targets.id }
+      - { name: facilityId, type: string, nullable: true, ref: facilities.id }
+      - { name: owner, type: string }
+      - { name: status, type: string, enum: [proposed, in_progress, completed, cancelled] }
+      - { name: startAt, type: string, format: date }
+      - { name: endAt, type: string, nullable: true, format: date }
+      - { name: capex, type: number }
+      - { name: expectedReductionTonnes, type: number }
+      - { name: actualReductionTonnes, type: number, default: 0 }
+      - { name: progressPct, type: number, 0_to_100: true }
+
+  - table: reports
+    purpose: Period snapshots (totals frozen at generation time) for CSRD-style reporting.
+    primaryKey: id
+    indexes: [status, periodStart]
+    fields:
+      - { name: id, type: string }
+      - { name: title, type: string }
+      - { name: periodStart, type: string, format: month }
+      - { name: periodEnd, type: string, format: month }
+      - { name: status, type: string, enum: [draft, in_review, published] }
+      - { name: scope1Tonnes, type: number }
+      - { name: scope2Tonnes, type: number, note: "location-based; market-based kept in breakdown" }
+      - { name: scope3Tonnes, type: number }
+      - { name: totalTonnes, type: number }
+      - { name: generatedAt, type: string, format: datetime }
+      - { name: publishedAt, type: string, nullable: true, format: datetime }
+
+  - table: auditLog
+    purpose: Proof-of-work trail for mock compliance workflows.
+    primaryKey: ++seq (auto-increment)
+    indexes: [at, entityType, "[entityType+entityId]"]
+    fields:
+      - { name: seq, type: number, auto: true }
+      - { name: at, type: string, format: datetime }
+      - { name: actor, type: string, example: "jdoe@korevel.io" }
+      - { name: action, type: string, enum: [create, update, recalculate, approve, publish, export] }
+      - { name: entityType, type: string, enum: [activity, emission, report, target, project] }
+      - { name: entityId, type: string }
+      - { name: summary, type: string, example: "Recalculated 14 emissions for 2026-08" }
+
+dexie_schema:
+  version: 1
+  stores:
+    facilities: "id, code, country, isActive"
+    emissionFactors: "id, key, scope, category, source, [scope+category]"
+    activities: "id, facilityId, date, scope, sourceType, category, [facilityId+date]"
+    emissions: "id, activityId, facilityId, scope, date, [scope+date]"
+    suppliers: "id, category, country, rating"
+    targets: "id, status, scope"
+    projects: "id, status, facilityId, targetId"
+    reports: "id, status, periodStart"
+    auditLog: "++seq, at, entityType, [entityType+entityId]"
+
+derived_view_models:
+  note: Computed in services/aggregates.ts from liveQuery results; never stored.
+  items:
+    - name: overviewKpis
+      fields: [totalTonnes, yoyDeltaPct, scope1, scope2, scope3, intensityPerM2, activeProjects, dataQualityPct]
+    - name: scopeBreakdown
+      fields: [scope, tonnes, pctOfTotal]
+    - name: monthlyTrend
+      fields: [month, scope1, scope2, scope3, total]
+      shape: "last 12 months, zero-filled"
+    - name: facilityLeaderboard
+      fields: [facilityId, name, tonnes, intensityPerM2, yoyDeltaPct]
+    - name: targetProgress
+      fields: [targetId, name, currentTonnes, targetTonnes, pctToTarget, onTrack, projectionTonnes]
+    - name: hotspotTable
+      fields: [sourceType, tonnes, pctOfTotal, trendPct]
+      note: "top emitters, powers the Pareto chart"
+
+screens:
+  - route: /modules/carbon-portal
+    component: CarbonPortalHome (overview dashboard)
+    reads: [overviewKpis, scopeBreakdown, monthlyTrend, targetProgress, hotspotTable]
+    writes: []
+  - route: /modules/carbon-portal/emissions
+    component: EmissionsExplorer
+    reads: [activities, emissions, facilities, emissionFactors]
+    writes: [activities, emissions, auditLog]
+    ui: "@mui/x-data-grid with facility/scope/period filters from portalStore"
+  - route: /modules/carbon-portal/scope-3
+    component: Scope3Suppliers
+    reads: [suppliers, activities]
+    writes: [suppliers, activities, auditLog]
+  - route: /modules/carbon-portal/targets
+    component: TargetsAndProjects
+    reads: [targets, projects, targetProgress]
+    writes: [targets, projects, auditLog]
+  - route: /modules/carbon-portal/reports
+    component: ReportsList
+    reads: [reports, overviewKpis]
+    writes: [reports, auditLog]
+    action: "Generate = snapshot aggregates into a report row + audit entry"
+  - route: /modules/carbon-portal/settings
+    component: PortalSettings
+    reads: [facilities, emissionFactors]
+    writes: [facilities, emissionFactors, auditLog]
+
+seed_data:
+  strategy: Deterministic (fixed pseudo-random seed) so charts/tests are stable; run once via seedIfEmpty() on first module mount.
+  generated_at: "2026-10-01"
+  period: rolling 12 months (2025-10 .. 2026-09)
+  tables:
+    facilities:
+      count: 4
+      samples:
+        - { code: FAC-NL-01, name: "Rotterdam Plant", city: Rotterdam, country: NL, sector: Manufacturing, floorAreaM2: 18500 }
+        - { code: FAC-DE-02, name: "Berlin Office", city: Berlin, country: DE, sector: Services, floorAreaM2: 3200 }
+        - { code: FAC-US-03, name: "Austin Warehouse", city: Austin, country: US, sector: Logistics, floorAreaM2: 12000 }
+        - { code: FAC-ES-04, name: "Madrid Data Center", city: Madrid, country: ES, sector: ICT, floorAreaM2: 900 }
+    emissionFactors:
+      count: 16
+      coverage: "scope 1 (diesel, gasoline, natural gas, refrigerant leak), scope 2 (grid NL/DE/US/ES, purchased heat), scope 3 (flights, rail, vehicles, waste, purchased goods, commuting)"
+      sources: [DEFRA, EPA, IPCC, IEA]
+    activities:
+      count: ~190
+      generation_rules:
+        - "grid electricity per facility per month (seasonal winter peak, +3% YoY efficiency)"
+        - "natural gas per facility per month (heating season profile)"
+        - "diesel/gasoline fleet monthly with mild growth trend"
+        - "flights quarterly (2-5 per quarter, international weighted higher)"
+        - "purchased goods monthly from supplier spend (spend_based)"
+        - "waste and commuting monthly"
+      data_quality_mix: { primary: 55, secondary: 35, spend_based: 10 }
+    emissions:
+      count: matches activities
+      rule: calculated by calculateEmissions() during seed, never written by hand
+    suppliers:
+      count: 8
+      samples:
+        - { name: "NordSteel AB", category: Raw materials, country: SE, dataQuality: secondary, rating: 4 }
+        - { name: "PolyPack GmbH", category: Packaging, country: DE, dataQuality: spend_based, rating: 2 }
+        - { name: "Global Freight Co", category: Logistics, country: NL, dataQuality: primary, rating: 5 }
+    targets:
+      count: 3
+      samples:
+        - { name: "SBTi 1.5C scope 1+2", scope: "1+2", baseYear: 2022, baselineTonnes: 4820, targetYear: 2030, targetTonnes: 2796, status: committed }
+        - { name: "Fleet electrification", scope: "1", baseYear: 2024, baselineTonnes: 640, targetYear: 2028, targetTonnes: 192, status: committed }
+        - { name: "Supplier engagement program", scope: "3", baseYear: 2023, baselineTonnes: 9100, targetYear: 2030, targetTonnes: 7280, status: draft }
+    projects:
+      count: 6
+      statuses: [proposed, in_progress, completed, cancelled]
+      samples:
+        - { name: "Rooftop solar Phase 1", facilityId: FAC-NL-01, status: in_progress, expectedReductionTonnes: 410, progressPct: 60 }
+        - { name: "Heat pump retrofit", facilityId: FAC-DE-02, status: completed, actualReductionTonnes: 145, progressPct: 100 }
+        - { name: "EV fleet swap", facilityId: FAC-US-03, status: in_progress, expectedReductionTonnes: 220, progressPct: 35 }
+    reports:
+      count: 3
+      samples:
+        - { title: "FY2025 Annual Inventory", periodStart: "2025-01", periodEnd: "2025-12", status: published }
+        - { title: "Q2 2026 Internal Review", periodStart: "2026-04", periodEnd: "2026-06", status: in_review }
+        - { title: "Q3 2026 Working Draft", periodStart: "2026-07", periodEnd: "2026-09", status: draft }
+    auditLog:
+      count: ~20
+      rule: generated from the seed actions (recalculate, publish, approve)
+
+seed_volume_check:
+  total_rows: ~270
+  reason: "Large enough for DataGrid pagination/virtualization and 12-month charts, small enough for instant IndexedDB boot."
+
+tasks:
+  - id: 1
+    title: Create db layer
+    detail: "db/types.ts, db/indexes.ts, db/schema.ts, db/database.ts (single Dexie instance exported as carbonPortalDb)"
+  - id: 2
+    title: Seed engine
+    detail: "db/seed.ts with deterministic generator + seedIfEmpty() called from the module layout client effect"
+  - id: 3
+    title: Calculation service
+    detail: "services/calculateEmissions.ts: match activity -> factor by category+unit, write emission, log to auditLog"
+  - id: 4
+    title: Aggregations
+    detail: "services/aggregates.ts: overviewKpis, scopeBreakdown, monthlyTrend, facilityLeaderboard, targetProgress, hotspotTable"
+  - id: 5
+    title: Data hooks
+    detail: "hooks/useCarbonData.ts wrapping useLiveQuery per model/aggregation"
+  - id: 6
+    title: Overview dashboard
+    detail: "Upgrade CarbonPortalHome with KPI cards, scope doughnut, 12-month trend line, target progress"
+  - id: 7
+    title: Emissions explorer
+    detail: "DataGrid screen with filters (facility, scope, period) from zustand store; inline add/edit activity modal"
+  - id: 8
+    title: Scope 3, targets, reports, settings screens
+    detail: "One route pair each under src/app/modules/carbon-portal/ referencing module components"
+  - id: 9
+    title: Report generation
+    detail: "reporting.ts: snapshot aggregates -> report row + audit entry; publish action flips status"
+  - id: 10
+    title: Validate
+    detail: "bun run lint && bun run typecheck && bun run build; manual smoke of all routes"
+
+validation:
+  - "bun run lint passes"
+  - "bun run typecheck passes (next typegen included)"
+  - "bun run build succeeds; routes for all screens listed"
+  - "First visit to /modules/carbon-portal seeds IndexedDB once; reload shows same data (no reseed)"
+  - "Overview KPIs equal sum of emission rows (aggregations verified against DataGrid total)"
+  - "Editing an activity quantity recalculates its emission and updates dashboard totals live"
+
+out_of_scope:
+  - Real API / react-query fetching
+  - Auth, roles, routing guards
+  - File uploads for evidence attachments (evidence can be a v2 table: evidence(id, activityId, fileName, hash, uploadedAt))
+  - Actual regulatory filing formats (CSRD XBRL, GHG Protocol PDF export)
+  - Multi-company / multi-tenant data
+
+future_extensions:
+  - evidence table for audit attachments
+  - market-based scope 2 (contractual instruments, RECs)
+  - EXIOBASE input-output factors for spend-based scope 3
+  - scenario modeling ("what-if" reduction simulator)
