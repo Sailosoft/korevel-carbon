@@ -21,4 +21,12 @@ export const APP_REGISTRY: AppDescriptor[] = [
     href: "/modules/carbon-portal",
     status: "available",
   },
+  {
+    id: "glassglow-erp",
+    name: "Glassglow ERP",
+    description:
+      "Glass-styled operations workspace with a people directory, roles, and live account KPIs.",
+    href: "/modules/glassglow-erp",
+    status: "available",
+  },
 ];
